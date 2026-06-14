@@ -3,7 +3,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.1"
+SCRIPT_VERSION="1.2"
 APP_NAME="wdtt-server"
 WDTT_RELEASE_BASE_URL="${WDTT_RELEASE_BASE_URL:-https://github.com/kkvoru/wdtt-server-entware/releases/latest/download}"
 WDTT_IFACE="wdtt0"
@@ -355,15 +355,26 @@ ENV_FILE=/opt/etc/wdtt/wdtt.env
 : "${WDTT_BIN:=/opt/bin/wdtt-server}"
 : "${WDTT_LOG:=/opt/var/log/wdtt-server.log}"
 : "${WDTT_PID:=/opt/var/run/wdtt.pid}"
+: "${WDTT_WATCHDOG_PID:=/opt/var/run/wdtt-watchdog.pid}"
 : "${WDTT_IFACE:=wdtt0}"
 : "${WDTT_SUBNET:=10.66.66.0/24}"
 : "${WDTT_NAT_IFACE:=}"
 : "${WDTT_DTLS_PORT:=56000}"
 : "${WDTT_WG_PORT:=56001}"
 : "${WDTT_SERVER_ARGS:=}"
+: "${WDTT_WATCHDOG_INTERVAL:=60}"
+: "${WDTT_MAX_ACTIVE:=96}"
 
 is_running() {
     [ -f "$WDTT_PID" ] && kill -0 "$(cat "$WDTT_PID")" 2>/dev/null
+}
+
+watchdog_running() {
+    [ -f "$WDTT_WATCHDOG_PID" ] && kill -0 "$(cat "$WDTT_WATCHDOG_PID")" 2>/dev/null
+}
+
+server_active_count() {
+    sed -n 's/.*"active":\([0-9][0-9]*\).*/\1/p' /opt/etc/wdtt/server.log 2>/dev/null | tail -n 1
 }
 
 ensure_rule() {
@@ -391,26 +402,17 @@ setup_runtime_firewall() {
     fi
 }
 
-start() {
-    [ "$ENABLED" = "yes" ] || exit 0
-    is_running && exit 0
+start_server() {
     mkdir -p "$(dirname "$WDTT_LOG")" "$(dirname "$WDTT_PID")"
     ip link show "$WDTT_IFACE" >/dev/null 2>&1 && ip link del "$WDTT_IFACE" 2>/dev/null || true
     echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
     setup_runtime_firewall
-    if command -v start-stop-daemon >/dev/null 2>&1; then
-        eval "start-stop-daemon -S -b -m -p \"$WDTT_PID\" -x \"$WDTT_BIN\" -- $WDTT_SERVER_ARGS >>\"$WDTT_LOG\" 2>&1"
-    else
-        eval "\"$WDTT_BIN\" $WDTT_SERVER_ARGS >>\"$WDTT_LOG\" 2>&1 &"
-        echo $! > "$WDTT_PID"
-    fi
+    eval "\"$WDTT_BIN\" $WDTT_SERVER_ARGS >>\"$WDTT_LOG\" 2>&1 &"
+    echo $! > "$WDTT_PID"
 }
 
-stop() {
-    if command -v start-stop-daemon >/dev/null 2>&1 && [ -f "$WDTT_PID" ]; then
-        start-stop-daemon -K -p "$WDTT_PID" 2>/dev/null || true
-        rm -f "$WDTT_PID"
-    elif [ -f "$WDTT_PID" ]; then
+stop_server() {
+    if [ -f "$WDTT_PID" ]; then
         kill "$(cat "$WDTT_PID")" 2>/dev/null || true
         rm -f "$WDTT_PID"
     fi
@@ -418,9 +420,59 @@ stop() {
     ip link show "$WDTT_IFACE" >/dev/null 2>&1 && ip link del "$WDTT_IFACE" 2>/dev/null || true
 }
 
+watchdog_restart() {
+    echo "$(date) watchdog: restart $1" >> "$WDTT_LOG" 2>/dev/null || true
+    stop_server
+    sleep 2
+    start_server
+}
+
+watchdog_loop() {
+    while :; do
+        sleep "$WDTT_WATCHDOG_INTERVAL"
+        is_running || { watchdog_restart "process is not running"; continue; }
+        ip link show "$WDTT_IFACE" >/dev/null 2>&1 || { watchdog_restart "$WDTT_IFACE is missing"; continue; }
+        netstat -uln 2>/dev/null | grep -q "[:.]$WDTT_DTLS_PORT[[:space:]]" || { watchdog_restart "DTLS port is not listening"; continue; }
+        active="$(server_active_count)"
+        case "$active" in
+            ''|*[!0-9]*) active=0 ;;
+        esac
+        if [ "$active" -ge "$WDTT_MAX_ACTIVE" ] 2>/dev/null; then
+            watchdog_restart "too many active connections: $active"
+        fi
+    done
+}
+
+start_watchdog() {
+    watchdog_running && return 0
+    mkdir -p "$(dirname "$WDTT_WATCHDOG_PID")"
+    watchdog_loop &
+    echo $! > "$WDTT_WATCHDOG_PID"
+}
+
+stop_watchdog() {
+    if [ -f "$WDTT_WATCHDOG_PID" ]; then
+        kill "$(cat "$WDTT_WATCHDOG_PID")" 2>/dev/null || true
+        rm -f "$WDTT_WATCHDOG_PID"
+    fi
+}
+
+start() {
+    [ "$ENABLED" = "yes" ] || exit 0
+    is_running || start_server
+    setup_runtime_firewall
+    start_watchdog
+}
+
+stop() {
+    stop_watchdog
+    stop_server
+}
+
 status() {
     if is_running; then
         echo "wdtt: running"
+        watchdog_running && echo "wdtt-watchdog: running" || echo "wdtt-watchdog: stopped"
     else
         echo "wdtt: stopped"
         exit 1
