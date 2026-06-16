@@ -430,6 +430,7 @@ watchdog_restart() {
 watchdog_loop() {
     while :; do
         sleep "$WDTT_WATCHDOG_INTERVAL"
+        setup_runtime_firewall
         is_running || { watchdog_restart "process is not running"; continue; }
         ip link show "$WDTT_IFACE" >/dev/null 2>&1 || { watchdog_restart "$WDTT_IFACE is missing"; continue; }
         netstat -uln 2>/dev/null | grep -q "[:.]$WDTT_DTLS_PORT[[:space:]]" || { watchdog_restart "DTLS port is not listening"; continue; }
